@@ -1,0 +1,117 @@
+name: Build kernel image
+inputs:
+  repository:
+    required: true
+    type: string
+  ref:
+    required: true
+    type: string
+  arch:
+    required: true
+    type: string
+  suffix:
+    required: true
+    type: string
+  release-tag:
+    required: true
+    type: string
+  defconfig:
+    required: false
+    type: string
+    default: defconfig
+runs:
+  using: composite
+  steps:
+    - name: Check out ${{ inputs.repository }}
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        path: build
+    - name: Set ARCH=${{ inputs.arch }} in environment
+      shell: bash
+      run: |
+        echo "ARCH=${{ inputs.arch }}" >> $GITHUB_ENV
+    - name: Install some helpful packages
+      shell: bash
+      run: sudo apt-get install libelf-dev
+    - name: Install crossbuild-essential-amd64 package
+      if: ${{ inputs.arch == 'x86' }}
+      shell: bash
+      run: |
+        sudo apt-get install crossbuild-essential-amd64
+        echo "CROSS_COMPILE=x86_64-linux-gnu-" >> $GITHUB_ENV
+    - name: Install crossbuild-essential-arm64 package
+      if: ${{ inputs.arch == 'arm64' }}
+      shell: bash
+      run: |
+        sudo apt-get install crossbuild-essential-arm64
+        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+    - name: Install crossbuild-essential-armhf package
+      if: ${{ inputs.arch == 'arm' }}
+      shell: bash
+      run: |
+        sudo apt-get install crossbuild-essential-armhf
+        echo "CROSS_COMPILE=arm-linux-gnueabihf-" >> $GITHUB_ENV
+    - name: Generate Linux kernel default config for ARCH=${{ inputs.arch }}
+      shell: bash
+      working-directory: ./build
+      run: make ${{ inputs.defconfig }}
+    - name: Generate KVM guest configuration
+      shell: bash
+      working-directory: ./build
+      run: make kvm_guest.config
+    - name: Build Image.gz
+      if: ${{ inputs.arch == 'arm64' }}
+      shell: bash
+      working-directory: ./build
+      run: |
+        make -j$(nproc) Image.gz
+        mv arch/${{ inputs.arch }}/boot/Image.gz Image-${{ inputs.suffix }}.gz
+    - name: Build zImage
+      if: ${{ inputs.arch == 'arm' }}
+      shell: bash
+      working-directory: ./build
+      run: |
+        make -j$(nproc) zImage
+        mv arch/${{ inputs.arch }}/boot/zImage zImage-${{ inputs.suffix }}
+    - name: Build bzImage
+      if: ${{ inputs.arch == 'x86' }}
+      shell: bash
+      working-directory: ./build
+      run: |
+        make -j$(nproc) bzImage
+        mv arch/${{ inputs.arch }}/boot/bzImage bzImage-${{ inputs.suffix }}
+    - name: Add Image.gz to the release
+      if: ${{ inputs.arch == 'arm64' }}
+      uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+      with:
+        tag: ${{ inputs.release-tag }}
+        draft: true
+        artifacts: build/Image-${{ inputs.suffix }}.gz
+        omitName: true
+        omitBody: true
+        allowUpdates: true
+        updateOnlyUnreleased: true
+    - name: Add zImage to the release
+      if: ${{ inputs.arch == 'arm' }}
+      uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+      with:
+        tag: ${{ inputs.release-tag }}
+        draft: true
+        artifacts: build/zImage-${{ inputs.suffix }}
+        omitName: true
+        omitBody: true
+        allowUpdates: true
+        updateOnlyUnreleased: true
+    - name: Add bzImage to the release
+      if: ${{ inputs.arch == 'x86' }}
+      uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+      with:
+        tag: ${{ inputs.release-tag }}
+        draft: true
+        artifacts: build/bzImage-${{ inputs.suffix }}
+        omitName: true
+        omitBody: true
+        allowUpdates: true
+        updateOnlyUnreleased: true
