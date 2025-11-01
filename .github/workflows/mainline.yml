@@ -1,0 +1,100 @@
+name: Build the mainline Linux kernel
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        required: false
+        type: string
+jobs:
+  mainline-ref:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ inputs.ref || steps.fetch-latest.outputs.ref }}
+      version: ${{ steps.parse-version.outputs.version }}
+    steps:
+      - name: Fetch the latest tag
+        id: fetch-latest
+        if: ${{ inputs.ref == '' }}
+        run: |
+          ref=$(git ls-remote --sort=-v:refname --refs https://github.com/torvalds/linux.git | awk '$2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+$/ { print substr($2, 11) }' | head -n 1)
+          echo "ref=${ref}" >> $GITHUB_OUTPUT
+      - name: Parse version
+        id: parse-version
+        run: |
+          ref=${{ inputs.ref || steps.fetch-latest.outputs.ref }}
+          if [[ ! $ref =~ ^v[0-9]+\.[0-9]+$ ]]; then
+            echo "Unsupported ref format '${ref}'"
+            exit 1
+          fi
+          echo "version=${ref:1}" >> $GITHUB_OUTPUT
+  draft-release:
+    runs-on: ubuntu-24.04
+    needs:
+      - mainline-ref
+    permissions:
+      contents: write
+    outputs:
+      tag-name: ${{ steps.tag-name.outputs.tag-name }}
+      release-id: ${{ steps.create-release.outputs.id }}
+    steps:
+      - name: Build tag name
+        id: tag-name
+        run: |
+          echo "tag-name=mainline-${{ needs.mainline-ref.outputs.version }}" >> $GITHUB_OUTPUT
+      - name: Create a release
+        id: create-release
+        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+        with:
+          tag: ${{ steps.tag-name.outputs.tag-name }}
+          commit: ${{ github.sha }}
+          draft: true
+          name: Mainline Linux kernel ${{ needs.mainline-ref.outputs.version }}
+          body: "Mainline Linux kernel built from the ${{ needs.mainline-ref.outputs.ref }} release tag"
+          skipIfReleaseExists: true
+  build:
+    runs-on: ubuntu-24.04
+    needs:
+      - mainline-ref
+      - draft-release
+    if: ${{ needs.draft-release.outputs.release-id != '' }}
+    strategy:
+      matrix:
+        arch:
+          - arm
+          - arm64
+          - x86
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Build the image
+        uses: ./.github/actions/build-image
+        with:
+          repository: torvalds/linux
+          ref: ${{ needs.mainline-ref.outputs.ref }}
+          version: ${{ needs.mainline-ref.outputs.version }}
+          arch: ${{ matrix.arch }}
+          release-tag: ${{ needs.draft-release.outputs.tag-name }}
+          suffix: ${{ needs.draft-release.outputs.tag-name }}-${{ matrix.arch }}
+  publish-release:
+    runs-on: ubuntu-24.04
+    needs:
+      - draft-release
+      - build
+    permissions:
+      contents: write
+    if: ${{ needs.draft-release.outputs.release-id != '' }}
+    steps:
+      - name: Publish
+        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+        with:
+          tag: ${{ needs.draft-release.outputs.tag-name }}
+          draft: false
+          omitName: true
+          omitBody: true
+          allowUpdates: true
+          updateOnlyUnreleased: true

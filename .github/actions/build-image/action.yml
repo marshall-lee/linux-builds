@@ -1,0 +1,177 @@
+name: Build kernel image
+inputs:
+  repository:
+    required: true
+    type: string
+  ref:
+    required: true
+    type: string
+  arch:
+    required: true
+    type: string
+  suffix:
+    required: true
+    type: string
+  release-tag:
+    required: true
+    type: string
+  version:
+    required: true
+    type: string
+  defconfig:
+    required: false
+    type: string
+    default: defconfig
+runs:
+  using: composite
+  steps:
+    - name: Check out ${{ inputs.repository }}
+      uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        path: build
+    - name: Parse kernel version
+      id: kernel-version
+      shell: bash
+      run: |
+        if [[ ! "${{ inputs.version }}" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+          echo "Unsupported version format '${{ inputs.version }}'"
+          exit 1
+        fi
+        echo kernel-version=${BASH_REMATCH[1]} >> $GITHUB_OUTPUT
+        echo kernel-revision=${BASH_REMATCH[2]} >> $GITHUB_OUTPUT
+    - name: Determine a proper Debian distro
+      id: debian-distro
+      shell: bash
+      run: |
+        if (( "${{ steps.kernel-version.outputs.kernel-version }}" < 4 )); then
+          echo "Kernel version '${{ inputs.version }}' is too old"
+          exit 1
+        fi
+        case "${{ steps.kernel-version.outputs.kernel-version }}" in
+          4)
+            if (( "${{ steps.kernel-version.outputs.kernel-revision }}" < 19 )); then
+              echo "Kernel version '${{ inputs.version }}' is too old"
+              exit 1
+            fi
+            echo codename=buster > $GITHUB_OUTPUT
+            ;;
+          5)
+            echo codename=bullseye > $GITHUB_OUTPUT
+            ;;
+          6)
+            if (( "${{ steps.kernel-version.outputs.kernel-revision }}" < 12 )); then
+              echo codename=bookworm > $GITHUB_OUTPUT
+            else
+              echo codename=trixie > $GITHUB_OUTPUT
+            fi
+            ;;
+        esac
+    - name: Run a builder container
+      shell: bash
+      run: |
+        docker run -d -t -v $PWD/build:/build -w /build --name builder debian:${{ steps.debian-distro.outputs.codename }}-slim sleep infinity
+    - name: Update apt sources
+      shell: bash
+      run: |
+        if [[ "${{ steps.debian-distro.outputs.codename }}" == buster ]]; then
+          docker exec builder bash -c "echo 'deb http://archive.debian.org/debian ${{ steps.debian-distro.outputs.codename }} main' > /etc/apt/sources.list"
+          docker exec builder bash -c "echo 'deb http://archive.debian.org/debian-security ${{ steps.debian-distro.outputs.codename }}/updates main' >> /etc/apt/sources.list"
+          docker exec builder bash -c "echo 'deb http://archive.debian.org/debian ${{ steps.debian-distro.outputs.codename }}-updates main' >> /etc/apt/sources.list"
+        fi
+        docker exec builder apt-get update
+    - name: Set ARCH=${{ inputs.arch }} in an environment file
+      shell: bash
+      run: |
+        echo "ARCH=${{ inputs.arch }}" >> .builder-env
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        packages=(
+          bison
+          flex
+          gcc
+          libelf-dev
+          make
+        )
+        case "${{ inputs.arch }}" in
+          x86)
+            if [[ "$RUNNER_ARCH" != X64 ]]; then
+              packages+=(gcc-x86-64-linux-gnu)
+              echo "CROSS_COMPILE=x86_64-linux-gnu-" >> .builder-env
+            fi
+            ;;
+          arm64)
+            if [[ "$RUNNER_ARCH" != ARM64 ]]; then
+              packages+=(gcc-aarch64-linux-gnu)
+              echo "CROSS_COMPILE=aarch64-linux-gnu-" >> .builder-env
+            fi
+            ;;
+          arm)
+            if [[ "$RUNNER_ARCH" != ARM ]]; then
+              packages+=(gcc-arm-linux-gnueabihf)
+              echo "CROSS_COMPILE=arm-linux-gnueabihf-" >> .builder-env
+            fi
+            ;;
+        esac
+        docker exec builder apt-get install -y "${packages[@]}"
+    - name: Generate Linux kernel default config for ARCH=${{ inputs.arch }}
+      shell: bash
+      run: |
+        docker exec --env-file .builder-env builder env
+        docker exec --env-file .builder-env builder make ${{ inputs.defconfig }}
+    - name: Generate KVM guest configuration
+      shell: bash
+      run: docker exec --env-file .builder-env builder make kvm_guest.config
+    - name: Build Image.gz
+      if: ${{ inputs.arch == 'arm64' }}
+      shell: bash
+      run: |
+        docker exec --env-file .builder-env builder make -j$(nproc) Image.gz
+        mv arch/${{ inputs.arch }}/boot/Image.gz Image-${{ inputs.suffix }}.gz
+    - name: Build zImage
+      if: ${{ inputs.arch == 'arm' }}
+      shell: bash
+      run: |
+        docker exec --env-file .builder-env builder make -j$(nproc) zImage
+        mv arch/${{ inputs.arch }}/boot/zImage zImage-${{ inputs.suffix }}
+    - name: Build bzImage
+      if: ${{ inputs.arch == 'x86' }}
+      shell: bash
+      run: |
+        docker exec --env-file .builder-env builder make -j$(nproc) bzImage
+        mv arch/${{ inputs.arch }}/boot/bzImage bzImage-${{ inputs.suffix }}
+    - name: Add Image.gz to the release
+      if: ${{ inputs.arch == 'arm64' }}
+      uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+      with:
+        tag: ${{ inputs.release-tag }}
+        draft: true
+        artifacts: build/Image-${{ inputs.suffix }}.gz
+        omitName: true
+        omitBody: true
+        allowUpdates: true
+        updateOnlyUnreleased: true
+    - name: Add zImage to the release
+      if: ${{ inputs.arch == 'arm' }}
+      uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+      with:
+        tag: ${{ inputs.release-tag }}
+        draft: true
+        artifacts: build/zImage-${{ inputs.suffix }}
+        omitName: true
+        omitBody: true
+        allowUpdates: true
+        updateOnlyUnreleased: true
+    - name: Add bzImage to the release
+      if: ${{ inputs.arch == 'x86' }}
+      uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+      with:
+        tag: ${{ inputs.release-tag }}
+        draft: true
+        artifacts: build/bzImage-${{ inputs.suffix }}
+        omitName: true
+        omitBody: true
+        allowUpdates: true
+        updateOnlyUnreleased: true
