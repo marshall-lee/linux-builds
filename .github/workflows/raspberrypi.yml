@@ -1,0 +1,136 @@
+name: Build the Raspberry Pi Linux kernel
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        required: false
+        type: string
+jobs:
+  rpi-ref:
+    runs-on: ubuntu-24.04
+    outputs:
+      ref: ${{ inputs.ref || steps.fetch-latest.outputs.ref }}
+      commit: ${{ steps.fetch-latest.outputs.commit || steps.fetch-commit.outputs.commit }}
+      version: ${{ steps.parse-version.outputs.version }}
+      kernel-version: ${{ steps.parse-version.outputs.kernel-version }}
+      kernel-revision: ${{ steps.parse-version.outputs.kernel-revision }}
+    steps:
+      - name: Fetch the latest tag
+        id: fetch-latest
+        if: ${{ inputs.ref == '' }}
+        run: |
+          readarray -d " " -t res < <(git ls-remote --sort=-v:refname --refs https://github.com/raspberrypi/linux.git | awk '$2 ~ /^refs\/heads\/rpi-[0-9]+\.[0-9]+\.y$/ { print substr($2, 12) " " substr($1, 0, 8) }' | head -n 1)
+          echo "ref=${res[0]}" >> $GITHUB_OUTPUT
+          echo "commit=${res[1]}" >> $GITHUB_OUTPUT
+      - name: Fetch commit hash
+        id: fetch-commit
+        if: ${{ inputs.ref != '' }}
+        run: |
+          commit=$(git ls-remote https://github.com/raspberrypi/linux.git ${{ inputs.ref }} | awk '{ print substr($1, 0, 8) }')
+          if [[ -z "$commit" ]]; then
+            echo "Failed to ls '${{ inputs.ref }}' ref"
+            exit 1
+          fi
+          echo "commit=${commit}" >> $GITHUB_OUTPUT
+      - name: Parse version
+        id: parse-version
+        run: |
+          ref=${{ inputs.ref || steps.fetch-latest.outputs.ref }}
+          if [[ ! $ref =~ ^rpi-([0-9]+)\.([0-9]+)\.y$ ]]; then
+            echo "Unsupported ref format '${ref}'"
+            exit 1
+          fi
+          echo "kernel-version=${BASH_REMATCH[1]}" >> $GITHUB_OUTPUT
+          echo "kernel-revision=${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+          echo "version=${BASH_REMATCH[1]}.${BASH_REMATCH[2]}" >> $GITHUB_OUTPUT
+  draft-release:
+    runs-on: ubuntu-24.04
+    needs:
+      - rpi-ref
+    permissions:
+      contents: write
+    outputs:
+      tag-name: ${{ steps.tag-name.outputs.tag-name }}
+      release-id: ${{ steps.create-release.outputs.id }}
+    steps:
+      - name: Build tag name
+        id: tag-name
+        run: |
+          echo "tag-name=rpi-${{ needs.rpi-ref.outputs.version }}-${{ needs.rpi-ref.outputs.commit }}" >> $GITHUB_OUTPUT
+      - name: Create a release
+        id: create-release
+        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+        with:
+          tag: ${{ steps.tag-name.outputs.tag-name }}
+          commit: ${{ github.sha }}
+          draft: true
+          name: Raspberry Pi Linux kernel ${{ needs.rpi-ref.outputs.version }} (${{ needs.rpi-ref.outputs.commit }})
+          body: "Raspberry Pi Linux kernel built from the [${{ needs.rpi-ref.outputs.ref }}](https://github.com/raspberrypi/linux/tree/${{ needs.rpi-ref.outputs.ref }}) branch on [${{ needs.rpi-ref.outputs.commit }}](https://github.com/raspberrypi/linux/commit/${{ needs.rpi-ref.outputs.commit }}) commit"
+          skipIfReleaseExists: true
+  build:
+    runs-on: ubuntu-24.04
+    needs:
+      - rpi-ref
+      - draft-release
+    if: ${{ needs.draft-release.outputs.release-id != '' }}
+    strategy:
+      matrix:
+        include:
+          - name: bcmrpi
+            arch: arm
+            defconfig: bcmrpi_defconfig
+            cond: true
+          - name: bcm2709
+            arch: arm
+            defconfig: bcm2709_defconfig
+            cond: true
+          - name: arm64
+            arch: arm64
+            defconfig: defconfig
+            cond: ${{ needs.rpi-ref.outputs.kernel-version >= 6 }}
+          - name: bcm2711
+            arch: arm64
+            defconfig: bcm2711_defconfig
+            cond: true
+          - name: bcm2712
+            arch: arm64
+            defconfig: bcm2712_defconfig
+            cond: ${{ needs.rpi-ref.outputs.kernel-version > 6 || (needs.rpi-ref.outputs.kernel-version == 6 && (needs.rpi-ref.outputs.kernel-revision == 1 || needs.rpi-ref.outputs.kernel-revision >= 5)) }}
+    permissions:
+      contents: write
+    steps:
+      - name: Check out
+        if: ${{ matrix.cond == true }}
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Build the kernel
+        if: ${{ matrix.cond == true }}
+        uses: ./.github/actions/build
+        with:
+          repository: raspberrypi/linux
+          ref: ${{ needs.rpi-ref.outputs.ref }}
+          version: ${{ needs.rpi-ref.outputs.version }}
+          arch: ${{ matrix.arch }}
+          release-tag: ${{ needs.draft-release.outputs.tag-name }}
+          defconfig: ${{ matrix.defconfig }}
+          suffix: ${{ needs.draft-release.outputs.tag-name }}-${{ matrix.name }}
+  publish-release:
+    runs-on: ubuntu-24.04
+    needs:
+      - draft-release
+      - build
+    permissions:
+      contents: write
+    if: ${{ needs.draft-release.outputs.release-id != '' }}
+    steps:
+      - name: Publish
+        uses: ncipollo/release-action@b7eabc95ff50cbeeedec83973935c8f306dfcd0b # v1.20.0
+        with:
+          tag: ${{ needs.draft-release.outputs.tag-name }}
+          draft: false
+          omitName: true
+          omitBody: true
+          allowUpdates: true
+          updateOnlyUnreleased: true
