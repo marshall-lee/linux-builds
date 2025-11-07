@@ -62,7 +62,7 @@ runs:
             echo codename=buster > $GITHUB_OUTPUT
             ;;
           5)
-            if (( "${{ steps.kernel-version.outputs.kernel-revision }}" <= 3 )); then
+            if (( "${{ steps.kernel-version.outputs.kernel-revision }}" <= 5 )); then
               echo codename=buster > $GITHUB_OUTPUT
             elif (( "${{ steps.kernel-version.outputs.kernel-revision }}" <= 13 )); then
               echo codename=bullseye > $GITHUB_OUTPUT
